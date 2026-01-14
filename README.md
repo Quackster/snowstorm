@@ -1,5 +1,15 @@
 # SnowWar Implementation Guide for Habbo Servers
 
+## Preface
+
+This was written by **Quackster**.
+
+Licensed under the **Apache License, Version 2.0** (Apache 2.0).  
+You may use, modify, and distribute this project in accordance with the license.
+
+**Attribution required:**  
+Please credit **Quackster** when using this as a reference guide.
+
 ## Executive Summary
 
 SnowWar (also known as SnowStorm) is a multiplayer snowball-fighting minigame where players throw snowballs at opponents to score points. The system uses a tick-based simulation with client synchronization via checksums, supports 1-4 teams, and includes features like snowball machines, player stunning, and configurable game durations.
