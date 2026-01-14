@@ -146,40 +146,57 @@ snowwar.increase.points=true
 
 ```pseudocode
 constants SnowWarConstants:
-    // Timing
-    SUBTURNS_PER_TICK = 5              // Subturns processed per server tick
-    SERVER_TICK_MS = 200               // Milliseconds between ticks
+    // ========================================================================
+    // TIMING (Critical for synchronization)
+    // ========================================================================
+    SUBTURNS_PER_TICK = 5              // Subturns (frames) processed per server tick
+    SERVER_TICK_MS = 300               // Milliseconds between scheduler invocations
+    SUBTURN_MS = 60                    // Effective ms per subturn (300 / 5)
 
-    // Movement
+    // ========================================================================
+    // MOVEMENT
+    // ========================================================================
     SUBTURN_MOVEMENT = 640             // World units moved per subturn
-    TILE_SIZE = 3200                   // World units per tile
+    TILE_SIZE = 3200                   // World units per tile (32 * 100)
     VELOCITY_DIVISOR = 255
     BASE_VELOCITY_MULTIPLIER = 2000
 
-    // Collision
-    COLLISION_RADIUS = 2000            // Circle radius for hit detection
+    // ========================================================================
+    // COLLISION
+    // ========================================================================
+    COLLISION_DISTANCE = 2000          // Circle radius for hit detection
     BALL_HEIGHT_THRESHOLD = 5000       // Max height for ball to hit player
 
-    // Health and snowballs
+    // ========================================================================
+    // HEALTH AND SNOWBALLS
+    // ========================================================================
     INITIAL_HEALTH = 4                 // Hits before stun
     MAX_SNOWBALLS = 5                  // Max snowballs player can hold
 
-    // Activity timers (in frames/subturns)
-    STUNNED_FRAMES = 125               // ~5 seconds
-    INVINCIBILITY_FRAMES = 60          // ~2.4 seconds
-    CREATING_SNOWBALL_FRAMES = 20      // ~0.8 seconds
+    // ========================================================================
+    // ACTIVITY TIMERS (in subturns/frames, NOT milliseconds)
+    // To convert: real_time_ms = timer_value * 60
+    // ========================================================================
+    STUNNED_TIMER = 125                // 125 frames = 7.5 seconds
+    INVINCIBILITY_TIMER = 60           // 60 frames = 3.6 seconds
+    CREATING_TIMER = 20                // 20 frames = 1.2 seconds
 
-    // Scoring
+    // ========================================================================
+    // SCORING
+    // ========================================================================
     HIT_SCORE = 1                      // Points for damaging opponent
     STUN_SCORE = 5                     // Points for knocking out opponent
 
-    // Cooldowns
-    THROW_COOLDOWN_MS = 300
+    // ========================================================================
+    // COOLDOWNS (in real milliseconds)
+    // ========================================================================
+    THROW_COOLDOWN_MS = 300            // Minimum time between throws
 
-    // Snowball machine
-    MACHINE_GENERATOR_TIME = 100       // Frames between snowball generation
-    MACHINE_MAX_CAPACITY = 5
-    MACHINE_PICKUP_TIME = 20
+    // ========================================================================
+    // SNOWBALL MACHINE (timers in subturns/frames)
+    // ========================================================================
+    MACHINE_SNOWBALL_GENERATOR_TIME = 100  // 100 frames = 6.0 seconds
+    MACHINE_MAX_SNOWBALL_CAPACITY = 5
 ```
 
 ---
@@ -254,20 +271,312 @@ class SnowWarMapsManager:
     maps = {}  // mapId -> SnowWarMap
 
     function parseMap(mapId):
+        // 1. Load item placements from arena file
         itemsFile = loadFile("arena_{mapId}.dat")
-        heightmapFile = loadFile("arena_{mapId}_heightmap.txt")
+        items = []
+
+        for each line in itemsFile.split(CR):  // Split by carriage return (char 13)
+            parts = line.split(" ")
+            item = new SnowWarItem(
+                itemId: parts[0],
+                itemName: parts[1],
+                x: parseInt(parts[2]),
+                y: parseInt(parts[3]),
+                z: parseInt(parts[4]),
+                rotation: parseInt(parts[5]),
+                height: getItemHeight(parts[1])  // Lookup from SnowWarItemProperties
+            )
+            items.add(item)
+
+        // 2. Load snowball machines (adds 3 tiles per machine)
         machinesFile = loadFile("arena_{mapId}_snowmachines.dat")
+        for each line in machinesFile.split(CR):
+            parts = line.split(" ")
+            x = parseInt(parts[0])
+            y = parseInt(parts[1])
+
+            // Main machine tile
+            items.add(new SnowWarItem("", "snowball_machine", x, y, 0, 0, 1))
+            // Hidden collision tiles (extend machine hitbox)
+            items.add(new SnowWarItem("", "snowball_machine_hidden", x + 1, y, 0, 0, 1))
+            items.add(new SnowWarItem("", "snowball_machine_hidden", x + 2, y, 0, 0, 1))
+
+        // 3. Load spawn clusters
         spawnsFile = loadFile("arena_{mapId}_spawn_clusters.dat")
+        spawnClusters = []
+        for each cluster in spawnsFile.split("|"):
+            parts = cluster.split(" ")
+            spawnClusters.add(new SpawnCluster(
+                x: parseInt(parts[0]),
+                y: parseInt(parts[1]),
+                radius: parseInt(parts[2]),
+                minDistance: parseInt(parts[3])
+            ))
 
-        items = parseItems(itemsFile)
-        heightmap = parseHeightmap(heightmapFile)
-        machines = parseMachines(machinesFile)
-        spawnClusters = parseSpawnClusters(spawnsFile)
-
-        maps[mapId] = new SnowWarMap(mapId, items, heightmap, machines, spawnClusters)
+        // 4. Load heightmap and create map
+        heightmap = loadHeightMap(mapId)
+        maps[mapId] = new SnowWarMap(mapId, items, heightmap, spawnClusters)
 
     function getMap(mapId):
         return maps[mapId]
+```
+
+### 5.4 Heightmap Parsing and Tile Creation
+
+When the map is created, the heightmap is parsed and combined with item data to create a 2D tile grid:
+
+```pseudocode
+class SnowWarMap:
+    tiles = [][]      // 2D array of SnowWarTile
+    mapSizeX = 0
+    mapSizeY = 0
+
+    function parseHeightMap():
+        lines = heightMap.split("|")
+        mapSizeY = lines.length
+        mapSizeX = lines[0].length
+
+        tiles = new SnowWarTile[mapSizeX][mapSizeY]
+
+        for y = 0 to mapSizeY - 1:
+            line = lines[y]
+
+            for x = 0 to mapSizeX - 1:
+                char = line.charAt(x)
+
+                // Check if tile is blocked by heightmap
+                isBlocked = (char == 'X' or char == 'x')
+
+                // Find all items at this position
+                itemsAtPosition = items.filter(item =>
+                    item.x == x and item.y == y
+                )
+
+                // Sort items by Z height (stacking order)
+                itemsAtPosition.sort(by: item.z)
+
+                // Create tile with collision data
+                tiles[x][y] = new SnowWarTile(x, y, isBlocked, itemsAtPosition)
+```
+
+### 5.5 Tile Walkability (Collision Detection)
+
+A tile's walkability is determined by TWO factors:
+
+```pseudocode
+class SnowWarTile:
+    x, y = 0
+    isBlocked = false       // From heightmap ('X' = blocked)
+    items = []              // Items placed on this tile
+    highestItem = null      // Tallest item (for collision)
+
+    constructor(x, y, isBlocked, items):
+        this.x = x
+        this.y = y
+        this.isBlocked = isBlocked
+        this.items = items
+
+        // Find the highest item on this tile
+        for each item in items:
+            if highestItem == null or item.z > highestItem.z:
+                highestItem = item
+
+    // ========================================================================
+    // PATHFINDER COLLISION: Can a player walk on this tile?
+    // ========================================================================
+    function isWalkable():
+        // Rule 1: Heightmap blocks tile
+        if isBlocked:
+            return false
+
+        // Rule 2: ANY item on tile blocks walking
+        // (Items have height > 0, making the tile unwalkable)
+        if highestItem != null:
+            return false
+
+        return true
+
+    // ========================================================================
+    // SNOWBALL COLLISION: Can a snowball pass over this tile?
+    // ========================================================================
+    function isHeightBlocking(trajectory):
+        if highestItem == null:
+            return false  // No obstacle
+
+        // Long trajectory (high arc) passes over everything
+        if trajectory == LONG_TRAJECTORY:
+            return false
+
+        // Short trajectory blocked by medium/tall obstacles
+        if trajectory == SHORT_TRAJECTORY:
+            return highestItem.height > 1
+
+        // Quick throw blocked by any obstacle
+        if trajectory == QUICK_THROW:
+            return highestItem.height > 0
+
+        return false
+```
+
+### 5.6 Item Properties Registry
+
+Items have TWO height properties for different collision systems:
+
+```pseudocode
+class SnowWarItemProperties:
+    // Registry: itemName -> (walkableHeight, collisionHeight)
+    PROPERTIES = {
+        // ====== TREES (block walking, block low snowballs) ======
+        "sw_tree1":     (walkableHeight: 3, collisionHeight: 4600),
+        "sw_tree2":     (walkableHeight: 3, collisionHeight: 4600),
+        "sw_tree3":     (walkableHeight: 3, collisionHeight: 4600),
+        "sw_tree4":     (walkableHeight: 3, collisionHeight: 4600),
+
+        // ====== BASIC BLOCKS (various heights) ======
+        "block_basic":  (walkableHeight: 1, collisionHeight: 2300),
+        "block_basic2": (walkableHeight: 2, collisionHeight: 4600),
+        "block_basic3": (walkableHeight: 3, collisionHeight: 6900),
+        "block_small":  (walkableHeight: 0, collisionHeight: 1150),
+
+        // ====== ICE BLOCKS ======
+        "block_ice":    (walkableHeight: 1, collisionHeight: 2300),
+        "block_ice2":   (walkableHeight: 2, collisionHeight: 4600),
+
+        // ====== ARCH BLOCKS (bottom parts) ======
+        "block_arch1b": (walkableHeight: 3, collisionHeight: 6900),
+        "block_arch2b": (walkableHeight: 3, collisionHeight: 6900),
+        "block_arch3b": (walkableHeight: 3, collisionHeight: 6900),
+
+        // ====== ARCH BLOCKS (top parts - can walk under) ======
+        "block_arch1":  (walkableHeight: 3, collisionHeight: 2300),
+        "block_arch2":  (walkableHeight: 0, collisionHeight: 2300),
+        "block_arch3":  (walkableHeight: 3, collisionHeight: 2300),
+
+        // ====== OBSTACLES ======
+        "obst_duck":    (walkableHeight: 1, collisionHeight: 2300),
+        "obst_snowman": (walkableHeight: 3, collisionHeight: 4600),
+
+        // ====== FENCE ======
+        "sw_fence":     (walkableHeight: 1, collisionHeight: 2500),
+
+        // ====== SNOWBALL MACHINE ======
+        "snowball_machine":        (walkableHeight: 1, collisionHeight: 2400),
+        "snowball_machine_hidden": (walkableHeight: 1, collisionHeight: 0),
+    }
+
+    // Used during map loading to set item.height for pathfinding
+    function getWalkableHeight(itemName):
+        return PROPERTIES[itemName].walkableHeight or 0
+
+    // Used during snowball physics to check if ball hits obstacle
+    function getCollisionHeight(itemName):
+        return PROPERTIES[itemName].collisionHeight or -1
+```
+
+### 5.7 Pathfinder Integration
+
+The pathfinder uses tile walkability plus player collision:
+
+```pseudocode
+class SnowWarPathfinder:
+    MAX_PATHFIND_ITERATIONS = 50
+
+    // Check if a tile is valid for movement
+    function isValidTile(game, player, position):
+        // Step 1: Get tile from map
+        tile = game.getMap().getTile(position)
+
+        // Step 2: Check tile exists and is walkable
+        if tile == null or not tile.isWalkable():
+            return false
+
+        // Step 3: Check no other player is on/moving to this tile
+        for each otherPlayer in game.getActivePlayers():
+            if otherPlayer == player:
+                continue
+
+            attr = SnowWarPlayers.get(otherPlayer)
+
+            // Check if player is moving to this tile
+            if attr.nextGoal != null:
+                if attr.nextGoal.equals(position):
+                    return false
+            else:
+                // Check current position
+                if attr.currentPosition.equals(position):
+                    return false
+
+        return true
+
+    // Get next tile in path towards goal
+    function getNextDirection(game, player):
+        attr = SnowWarPlayers.get(player)
+        positions = []
+
+        // Check all 8 diagonal directions
+        for each direction in DIAGONAL_MOVE_POINTS:
+            candidatePos = attr.currentPosition.copy().add(direction)
+
+            if isValidTile(game, player, candidatePos):
+                positions.add(candidatePos)
+
+        // Sort by distance to goal (closest first)
+        positions.sort(by: pos.getDistanceSquared(attr.walkGoal))
+
+        return positions.isEmpty() ? null : positions[0]
+```
+
+### 5.8 Collision Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MAP LOADING FLOW                                     │
+│                                                                              │
+│  arena_1.dat ───────────────┐                                               │
+│  (items: x, y, z, name)     │                                               │
+│                             ▼                                               │
+│  arena_1_snowmachines.dat ──┼──► Parse Items ──► SnowWarItem[]              │
+│  (machine positions)        │         │              │                      │
+│                             │         │              ▼                      │
+│  arena_1_heightmap.txt ─────┼─────────┼──────► Parse Heightmap              │
+│  (X = blocked, 0 = open)    │         │              │                      │
+│                             │         │              ▼                      │
+│                             │         └────────► Create Tile Grid           │
+│                             │                        │                      │
+│                             │                        ▼                      │
+│                             │              ┌─────────────────────┐          │
+│                             │              │   SnowWarTile[x][y] │          │
+│                             │              │   - isBlocked       │          │
+│                             │              │   - items[]         │          │
+│                             │              │   - highestItem     │          │
+│                             │              └─────────────────────┘          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      RUNTIME COLLISION CHECKS                                │
+│                                                                              │
+│  PLAYER MOVEMENT:                                                           │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
+│  │ Player wants │ ──► │ Check tile   │ ──► │ Check other  │ ──► Allow/Deny │
+│  │ to move      │     │ isWalkable() │     │ players      │                │
+│  └──────────────┘     └──────────────┘     └──────────────┘                │
+│                              │                                              │
+│                              ▼                                              │
+│                       isBlocked? ──► NO                                     │
+│                              │                                              │
+│                              ▼                                              │
+│                       hasItem? ──► YES = BLOCKED                            │
+│                                                                              │
+│  SNOWBALL PHYSICS:                                                          │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
+│  │ Snowball at  │ ──► │ Get tile at  │ ──► │ Check item   │ ──► Hit/Pass   │
+│  │ position     │     │ world coords │     │ collision    │                │
+│  └──────────────┘     └──────────────┘     │ height       │                │
+│                                            └──────────────┘                │
+│                                                   │                         │
+│                                                   ▼                         │
+│                                     ballHeight < collisionHeight? ──► HIT   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -405,19 +714,55 @@ The SnowWar game uses a **tick-based simulation** where the server processes gam
 ### 7.1 Two-Level Timing System
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           SERVER TICK (~200ms)                          │
-│                                                                         │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐       │
-│  │ Subturn │  │ Subturn │  │ Subturn │  │ Subturn │  │ Subturn │       │
-│  │    0    │  │    1    │  │    2    │  │    3    │  │    4    │       │
-│  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └─────────┘       │
-│       │            │            │            │            │             │
-│       ▼            ▼            ▼            ▼            ▼             │
-│   [events]     [events]     [events]     [events]     [events]         │
-│                                                                         │
-│  After all subturns: Calculate checksum, send GAMESTATUS packet        │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SERVER TICK (300ms interval)                         │
+│                                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ Subturn  │  │ Subturn  │  │ Subturn  │  │ Subturn  │  │ Subturn  │       │
+│  │    0     │  │    1     │  │    2     │  │    3     │  │    4     │       │
+│  │  (60ms)  │  │  (60ms)  │  │  (60ms)  │  │  (60ms)  │  │  (60ms)  │       │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘       │
+│       │             │             │             │             │              │
+│       ▼             ▼             ▼             ▼             ▼              │
+│   [events]      [events]      [events]      [events]      [events]          │
+│                                                                              │
+│  After all subturns: Calculate checksum, send GAMESTATUS packet             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 Exact Timing Values
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Server Tick Interval** | **300ms** | Time between scheduler invocations |
+| **Subturns Per Tick** | **5** | Game frames processed per tick |
+| **Subturn Duration** | **60ms** | Effective time per subturn (300ms ÷ 5) |
+| **Packets Per Second** | **~3.33** | GAMESTATUS packets sent per second |
+| **Game Frames Per Second** | **~16.67** | Subturns processed per second (5 × 3.33) |
+
+```pseudocode
+// Task scheduling (in RoomTaskManager)
+scheduleTask("UpdateTask", new SnowWarGameTask(room, game),
+             initialDelay: 0,
+             period: 300,
+             unit: MILLISECONDS)
+
+// Constants
+SUBTURNS_PER_TICK = 5        // MAX_GAME_TURNS in code
+SERVER_TICK_MS = 300         // Scheduler period
+SUBTURN_MS = 60              // 300 / 5 = 60ms per subturn
+```
+
+### 7.3 Timer Conversions
+
+Activity timers in the code are measured in **subturns (frames)**, not milliseconds:
+
+```pseudocode
+// Convert timer values to real time:
+STUNNED_TIMER = 125 frames     → 125 × 60ms = 7,500ms = 7.5 seconds
+INVINCIBILITY_TIMER = 60 frames → 60 × 60ms = 3,600ms = 3.6 seconds
+CREATING_TIMER = 20 frames      → 20 × 60ms = 1,200ms = 1.2 seconds
+MACHINE_GENERATOR_TIME = 100    → 100 × 60ms = 6,000ms = 6.0 seconds
 ```
 
 **Why this design?**
@@ -426,7 +771,7 @@ The SnowWar game uses a **tick-based simulation** where the server processes gam
 2. **Smooth animation**: Client interpolates between subturns for fluid movement
 3. **Deterministic simulation**: Both client and server simulate the same subturns, verified by checksum
 
-### 7.2 Main Game Loop
+### 7.5 Main Game Loop
 
 ```pseudocode
 class SnowWarGameTask:
@@ -530,16 +875,40 @@ class SnowWarGameTask:
         turnEventsList[0].add(event)  // Add to first subturn
 ```
 
-### 7.3 Timing Diagram
+### 7.4 Timing Diagram
 
 ```
-Time ────────────────────────────────────────────────────────────────────►
+Time (ms)  0        300        600        900       1200
+           │         │          │          │          │
+           ▼         ▼          ▼          ▼          ▼
+           ├─────────┼──────────┼──────────┼──────────┤
+           │  Tick 1 │  Tick 2  │  Tick 3  │  Tick 4  │
+           └─────────┴──────────┴──────────┴──────────┘
 
-Server Tick 1                    Server Tick 2                    Server Tick 3
-    │                                │                                │
-    ▼                                ▼                                ▼
+
+Detail of one server tick (300ms):
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              SERVER TICK (300ms)                                 │
+│                                                                                  │
+│  0ms      60ms     120ms     180ms     240ms     300ms                          │
+│   │        │         │         │         │         │                             │
+│   ▼        ▼         ▼         ▼         ▼         ▼                             │
+│ ┌────┐  ┌────┐   ┌────┐   ┌────┐   ┌────┐                                       │
+│ │ S0 │  │ S1 │   │ S2 │   │ S3 │   │ S4 │  → Checksum → Send GAMESTATUS        │
+│ └────┘  └────┘   └────┘   └────┘   └────┘                                       │
+│                                                                                  │
+│ Each subturn (S0-S4):                                                           │
+│   1. Move all avatars one frame                                                 │
+│   2. Check collisions                                                           │
+│   3. Move all snowballs one frame                                               │
+│   4. Process machine generators                                                 │
+│   5. Collect events for this subturn                                            │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+
+Full timeline example:
 ┌───────────────────────┐    ┌───────────────────────┐    ┌───────────────────────┐
-│ Turn 1                │    │ Turn 2                │    │ Turn 3                │
+│ Turn 1  (0-300ms)     │    │ Turn 2  (300-600ms)   │    │ Turn 3  (600-900ms)   │
 │                       │    │                       │    │                       │
 │ Subturn 0: [events]   │    │ Subturn 0: [events]   │    │ Subturn 0: [events]   │
 │ Subturn 1: [events]   │    │ Subturn 1: [events]   │    │ Subturn 1: [events]   │
@@ -552,7 +921,7 @@ Server Tick 1                    Server Tick 2                    Server Tick 3
             │                            │                            │
             ▼                            ▼                            ▼
       [GAMESTATUS]                 [GAMESTATUS]                 [GAMESTATUS]
-       packet sent                  packet sent                  packet sent
+       @ 300ms                      @ 600ms                      @ 900ms
             │                            │                            │
             ▼                            ▼                            ▼
 ┌───────────────────────────────────────────────────────────────────────────────────┐
@@ -633,7 +1002,6 @@ enum SnowWarActivityState:
     CREATING_SNOWBALL   = (stateId: 1, timer: 20)    // Making snowball
     STUNNED             = (stateId: 2, timer: 125)   // Knocked out
     INVINCIBLE          = (stateId: 3, timer: 60)    // Recovery immunity
-    PICKUP_MACHINE      = (stateId: 4, timer: 20)    // At machine
 ```
 
 ---
